@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -38,6 +39,52 @@ def __preprocess_image(image_path: Path, transform):
     return transform(img)
 
 
+def __postprocess_image(
+    binary_img: np.ndarray, looseness: int = 30, min_radius: int = 15
+) -> np.ndarray:
+    # Ensure binary (0 or 255)
+    _, binary = cv2.threshold(binary_img, 127, 255, cv2.THRESH_BINARY)
+
+    # Invert so that foreground = 255, background = 0
+    inverted = cv2.bitwise_not(binary)
+
+    if looseness > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (looseness, looseness))
+        inverted = cv2.morphologyEx(inverted, cv2.MORPH_CLOSE, kernel)
+
+    # Connected components on inverted (foreground=255)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        inverted, connectivity=8
+    )
+
+    # Start with white background
+    output = np.full_like(binary, 255, dtype=np.uint8)
+
+    # Loop over each component (skip background label 0)
+    for i in range(1, num_labels):
+        # Mask for this component
+        mask = (labels == i).astype("uint8")
+
+        # Pixel coordinates
+        points = np.column_stack(np.where(mask > 0))
+        points = np.flip(points, axis=1)  # (row, col) -> (x, y)
+
+        if len(points) == 0:
+            continue
+
+        # Minimum enclosing circle
+        (x, y), radius = cv2.minEnclosingCircle(points)
+        if radius < min_radius:
+            continue
+
+        # Draw black filled circle
+        center = (int(x), int(y))
+        radius = int(radius)
+        cv2.circle(output, center, radius, 0, -1)
+
+    return output
+
+
 def run_inference(
     model,
     image_paths,
@@ -68,11 +115,14 @@ def run_inference(
 
         # mask_np = __postprocess_mask(pred)
         mask_np = pred * 255
+        mask_np = mask_np.astype(np.uint8)
         if __mostly_white(mask_np):
             progress_info.percent_complete = int(i / len(image_paths) * 100)
             progress_info.status = str(f"Running inference ({i}/{len(image_paths)})")
             progress_info.progress_changed.emit()
             continue
+
+        mask_np = __postprocess_image(mask_np)
 
         # Save predicted mask
         output_path = output_dir.joinpath(f"{img_path.stem}.png").as_posix()
